@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import struct
 import tempfile
 import threading
@@ -592,3 +593,236 @@ def test_concurrent_merges_both_take_effect(client):
         {"start_frame": 112000, "end_frame": 160000},
     ]
     assert cur["product_frames"] == 16000 + 64000 + 48000
+
+
+def _revision_snapshot(pid, revision):
+    """直接从不可变修订表读出该修订的保留段、成品帧数与章节投影，作为期望。"""
+    conn = sqlite3.connect(app_module.DB_PATH)
+    try:
+        seg_rows = conn.execute(
+            "SELECT start_frame, end_frame FROM revision_segments "
+            "WHERE program_id = ? AND revision = ? ORDER BY idx",
+            (pid, revision),
+        ).fetchall()
+        segments = [(s, e) for s, e in seg_rows]
+        chapter_rows = conn.execute(
+            "SELECT title, start_frame FROM chapters WHERE program_id = ? ORDER BY idx",
+            (pid,),
+        ).fetchall()
+        chapters = [{"title": t, "start_frame": f} for t, f in chapter_rows]
+    finally:
+        conn.close()
+    return {
+        "revision": revision,
+        "keep_segments": [{"start_frame": s, "end_frame": e} for s, e in segments],
+        "product_frames": sum(e - s for s, e in segments),
+        "chapters": app_module.project_chapters(chapters, segments),
+    }
+
+
+def test_concurrent_merges_response_describes_own_revision(client, monkeypatch):
+    """确定性回归：先提交修订 1 的合入，必须在修订 2 已写入后仍返回自己的修订。
+
+    在数据库连接层面拦截合入事务的 COMMIT（该边界在修复前后代码中完全一致）：
+    提交修订 1 的请求在 COMMIT 之后、生成响应之前阻塞，确定地等待第二笔合入
+    完整完成（拿到写锁、合入、提交修订 2 并生成响应）后才继续。
+    修复前第一笔会重新读取此刻的当前修订 2，于是两笔响应都返回修订 2 的
+    保留段/成品帧数/章节投影；修复后第一笔仍返回自己写入的修订 1。
+    """
+    pid = _make_program(client)  # 必留口播 [50000,60000)，章节见 _make_program
+    segs_a = [  # 删除 [16000,32000)
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 160000},
+    ]
+    segs_b = [  # 删除 [96000,112000)，与 A 不相交
+        {"start_frame": 0, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+
+    a_committed = threading.Event()  # 第一笔（A）已提交修订 1
+    b_done = threading.Event()       # 第二笔（B）已提交修订 2 且响应已完整生成
+    thread_role = threading.local()
+    real_connect = sqlite3.connect
+
+    class CommitHookConn:
+        """连接代理：只在合入线程的提交点注入阻塞，其余行为原样透传。"""
+
+        def __init__(self, conn):
+            role = getattr(thread_role, "role", None)
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "_role", role)
+            object.__setattr__(self, "_written_revision", None)
+
+        def execute(self, sql, params=()):
+            conn = object.__getattribute__(self, "_conn")
+            cur = conn.execute(sql, params) if params else conn.execute(sql)
+            text = sql.strip().upper() if isinstance(sql, str) else ""
+            if object.__getattribute__(self, "_role") in ("a", "b"):
+                if text.startswith("UPDATE PROGRAMS SET CURRENT_REVISION") and params:
+                    object.__setattr__(self, "_written_revision", params[0])
+                elif (text == "COMMIT"
+                      and object.__getattribute__(self, "_role") == "a"
+                      and object.__getattribute__(self, "_written_revision") == 1):
+                    # A 已提交修订 1、响应尚未生成：放行 B，确定地等 B 完整完成后再继续。
+                    a_committed.set()
+                    assert b_done.wait(15), "第二笔合入未在超时内完成"
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_conn"), name)
+
+        def __setattr__(self, name, value):
+            setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def hooked_connect(*args, **kwargs):
+        return CommitHookConn(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(app_module.sqlite3, "connect", hooked_connect)
+
+    results = {}
+
+    def merge_a():
+        thread_role.role = "a"
+        with app_module.app.test_client() as c:
+            results["a"] = _merge(c, pid, 0, segs_a)
+
+    def merge_b():
+        thread_role.role = "b"
+        # 在 A 提交修订 1 之前绝不发起请求，保证 A 拿到第一个写锁成为修订 1
+        assert a_committed.wait(15), "第一笔合入未在超时内提交"
+        with app_module.app.test_client() as c:
+            results["b"] = _merge(c, pid, 0, segs_b)
+        # 第二笔响应已完整生成后才放行第一笔
+        b_done.set()
+
+    t1 = threading.Thread(target=merge_a)
+    t2 = threading.Thread(target=merge_b)
+    t1.start(); t2.start()
+    t1.join(20); t2.join(20)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    assert results["a"].status_code == 200, results["a"].status
+    assert results["b"].status_code == 200, results["b"].status
+
+    # 两笔响应必须各自携带不同的修订号（修复前第一笔会错误地也返回修订 2）
+    resp_by_revision = {r.get_json()["revision"]: r.get_json()
+                        for r in (results["a"], results["b"])}
+    assert sorted(resp_by_revision) == [1, 2]
+
+    # 每笔成功响应都对应自己写入的修订：修订号、保留段、成品帧数、章节投影一致
+    for rev, body in sorted(resp_by_revision.items()):
+        expected = _revision_snapshot(pid, rev)
+        assert body["revision"] == rev
+        assert body["keep_segments"] == expected["keep_segments"]
+        assert body["product_frames"] == expected["product_frames"]
+        assert body["chapters"] == expected["chapters"]
+
+    # 修订 1 只含第一笔自己的删除，修订 2 含两笔非冲突修改
+    first, second = resp_by_revision[1], resp_by_revision[2]
+    assert first["keep_segments"] == segs_a
+    assert first["product_frames"] == 16000 + 128000
+    assert second["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+    assert second["product_frames"] == 16000 + 64000 + 48000
+
+    # 最终当前版本仍包含两笔非冲突修改，章节投影按最终修订
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 2
+    assert cur["keep_segments"] == second["keep_segments"]
+    assert cur["product_frames"] == second["product_frames"]
+    assert cur["chapters"] == _revision_snapshot(pid, 2)["chapters"]
+
+
+def test_concurrent_merges_same_deletion_one_conflict_no_write(client):
+    """两笔基于同一旧修订、删除同一区间的并发合入：一个成功，另一个 409 且不写入。"""
+    pid = _make_program(client)
+    same = [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 160000},
+    ]
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def merge_a():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["a"] = _merge(c, pid, 0, same)
+
+    def merge_b():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["b"] = _merge(c, pid, 0, same)
+
+    t1, t2 = threading.Thread(target=merge_a), threading.Thread(target=merge_b)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    statuses = sorted(r.status_code for r in results.values())
+    assert statuses == [200, 409]
+    conflict = next(r for r in results.values() if r.status_code == 409).get_json()
+    assert conflict["error"] == "merge_conflict"
+    assert conflict["current_revision"] == 1
+    assert conflict["conflicts"] == [{"start_frame": 16000, "end_frame": 32000}]
+
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    assert cur["keep_segments"] == same
+
+
+def test_concurrent_merges_must_keep_failure_rejected_no_write(client):
+    """并发合入：删段会破坏必留口播的一笔即使在另一笔成功后执行，仍 400 且不写入。"""
+    pid = _make_program(client)  # 必留口播 [50000,60000)
+    good = [  # 删 [16000,32000)，口播仍完整保留
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 160000},
+    ]
+    bad = [  # 删 [48000,96000)，口播 [50000,60000) 被整体删除
+        {"start_frame": 0, "end_frame": 48000},
+        {"start_frame": 96000, "end_frame": 160000},
+    ]
+    # 先让一笔合规合入生效，再以修订 0 为基版提交坏建议：
+    # 坏建议相对基版的改动与修订 1 的删除不相交，因此唯一拒绝原因是必留口播。
+    ok = _merge(client, pid, 0, good)
+    assert ok.status_code == 200 and ok.get_json()["revision"] == 1
+    resp = _merge(client, pid, 0, bad)
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["error"] == "must_keep_uncovered"
+    assert body["must_keep"] == {"start_frame": 50000, "end_frame": 60000}
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    assert cur["keep_segments"] == good
+
+
+def test_concurrent_puts_winner_response_describes_own_revision(client):
+    """并发提交同一 expected_revision：赢家返回自己写入的修订，输家 409 不写入。"""
+    pid = _make_program(client)
+    barrier = threading.Barrier(2)
+    results = {}
+    segs = [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 88000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+
+    def put(tag):
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results[tag] = c.put(f"/programs/{pid}/keeps", json={
+                "expected_revision": 0,
+                "keep_segments": segs,
+            })
+
+    t1, t2 = threading.Thread(target=put, args=("a",)), threading.Thread(target=put, args=("b",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    winner = next(r for r in results.values() if r.status_code == 200).get_json()
+    loser = next(r for r in results.values() if r.status_code == 409).get_json()
+    assert winner["revision"] == 1
+    assert winner["keep_segments"] == segs
+    assert winner["product_frames"] == 32000 + 40000 + 48000
+    assert winner["chapters"] == _revision_snapshot(pid, 1)["chapters"]
+    assert loser["error"] == "stale_revision" and loser["current_revision"] == 1
+    assert client.get(f"/programs/{pid}").get_json()["revision"] == 1

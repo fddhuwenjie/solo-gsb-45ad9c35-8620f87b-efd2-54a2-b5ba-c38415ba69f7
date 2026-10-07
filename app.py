@@ -10,7 +10,9 @@
 - 旧版建议合入：提交建议依据的基版修订号与完整保留清单，三方（建议 / 当前 / 基版）
   比较保留状态；两侧改动的帧区间互不重叠才合成新修订，区间相交即返回冲突区间
   （双方都删同一段也算冲突，不擅自覆盖），基版不存在、清单非法或合入结果违反
-  必留口播完整落入单段时拒绝，当前版本保持不变。
+  必留口播完整落入单段时拒绝，当前版本保持不变。成功响应描述本请求自己写入的修订
+  （修订号、保留段、成品帧数、章节投影彼此对应）；并发下另一请求随后写入更新的修订
+  也不会让先完成者拿到别人的内容。
 - 下载 ZIP：包含真正裁接好的 WAV 与 JSON 章节表，
   两者取自同一修订的不可变快照，并发编辑不会混用版本。
 - 所有状态存于 SQLite，重启后仍可继续编辑节目。
@@ -442,10 +444,19 @@ def _fetch_must_keeps(db, pid):
     return [(r["start_frame"], r["end_frame"]) for r in rows]
 
 
-def _program_payload(db, row):
+def _program_payload(db, row, revision=None, segments=None):
+    """构造版本快照载荷。
+
+    revision 默认取当前修订号；显式传入时，保留段、成品帧数与章节投影都按
+    该次写入自己的修订计算——提交/合入事务提交后，当前修订号可能已被其它并发
+    请求推进，成功响应必须描述本请求实际写入的那个修订，而不是此刻的最新修订。
+    历史修订不可变，故按显式修订号取段与按提交时已算出的段是等价的。
+    """
     pid = row["id"]
-    revision = row["current_revision"]
-    segments = _fetch_segments(db, pid, revision)
+    if revision is None:
+        revision = row["current_revision"]
+    if segments is None:
+        segments = _fetch_segments(db, pid, revision)
     chapters = _fetch_chapters(db, pid)
     must_keeps = _fetch_must_keeps(db, pid)
     product_frames = sum(e - s for s, e in segments)
@@ -516,7 +527,7 @@ def create_program():
         raise
 
     row = _fetch_program(db, pid)
-    return jsonify(_program_payload(db, row)), 201
+    return jsonify(_program_payload(db, row, revision=0)), 201
 
 
 @app.get("/programs")
@@ -591,8 +602,10 @@ def put_keeps(pid):
         db.execute("ROLLBACK")
         raise
 
-    row = _fetch_program(db, pid)
-    return jsonify(_program_payload(db, row))
+    # 返回本次写入的 new_revision 快照，而非此刻的最新修订：
+    # 并发下本请求提交后、响应生成前，可能已有另一个提交/合入再推进修订号，
+    # 成功响应中的修订号、保留段、成品帧数与章节投影必须彼此对应。
+    return jsonify(_program_payload(db, row, revision=new_revision, segments=segments))
 
 
 @app.post("/programs/<pid>/merges")
@@ -602,6 +615,10 @@ def merge_keeps(pid):
     建议、当前修订、基版的「比较 -> 校验 -> 写入」在同一个 BEGIN IMMEDIATE
     事务内完成，因此并发合入/提交看到的都是受保护的当前状态，
     已生效的修改不会被后来者基于旧状态覆盖丢失。
+
+    成功响应按本请求写入的新修订号构造：事务提交后当前修订号可能已被另一个
+    并发合入推进，此时响应仍描述自己写入的修订（修订号、保留段、成品帧数、
+    章节投影彼此对应），而不是响应生成时的最新修订。
     """
     body = request.get_json(silent=True)
     if body is None:
@@ -675,8 +692,10 @@ def merge_keeps(pid):
         db.execute("ROLLBACK")
         raise
 
-    row = _fetch_program(db, pid)
-    return jsonify(_program_payload(db, row))
+    # 与 PUT 同理：返回本次合入自己写入的 new_revision 快照。
+    # 并发合入时本请求先提交修订 N、另一请求后提交修订 N+1 的情况下，
+    # 这里也必须返回修订 N 的保留段、成品帧数与章节投影，而不是修订 N+1。
+    return jsonify(_program_payload(db, row, revision=new_revision, segments=merged))
 
 
 @app.get("/programs/<pid>/download")
