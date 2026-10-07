@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import queue
 import struct
 import tempfile
 import threading
@@ -592,3 +593,106 @@ def test_concurrent_merges_both_take_effect(client):
         {"start_frame": 112000, "end_frame": 160000},
     ]
     assert cur["product_frames"] == 16000 + 64000 + 48000
+
+
+def test_concurrent_merge_response_matches_own_written_revision(client, monkeypatch):
+    """回归：第二笔合入在第一笔提交后、响应前完成时，两笔的成功响应都必须
+    对应各自写入的修订（修订号、保留段、成品帧数、章节投影），
+    第一笔不能返回第二笔写入的修订内容；最终当前版本包含两笔非冲突修改。
+
+    确定性交错的做法：钩住合入处理对 _fetch_program 的两次调用——
+    第一次在事务内（已持有写锁），第二次在 COMMIT 之后、响应之前。
+    先让第一笔进入事务再启动第二笔，保证提交次序；第一笔在第二次调用处
+    卡住，直到第二笔的请求完整结束才放行去组装自己的响应。
+    """
+    pid = _make_program(client)  # 修订 0 全保留，必留口播 [50000,60000)
+
+    orig_fetch = app_module._fetch_program
+    entered = queue.Queue()               # 某线程的合入事务已拿到写锁
+    first_committed = threading.Event()   # 第一笔已提交并停在响应前
+    second_finished = threading.Event()   # 第二笔请求已完整结束
+    calls = {}
+    gate_lock = threading.Lock()
+    gate = {"taken": False}
+
+    def spy_fetch(db, pid_arg):
+        ident = threading.get_ident()
+        calls[ident] = calls.get(ident, 0) + 1
+        n = calls[ident]
+        if n == 1:
+            entered.put(ident)
+        elif n == 2:
+            # “COMMIT 之后、响应之前”：只卡住先到者（即第一笔），
+            # 等第二笔彻底完成，确定地复现响应读到他人修订的交错
+            with gate_lock:
+                is_first = not gate["taken"]
+                gate["taken"] = True
+            if is_first:
+                first_committed.set()
+                assert second_finished.wait(timeout=10)
+        return orig_fetch(db, pid_arg)
+
+    monkeypatch.setattr(app_module, "_fetch_program", spy_fetch)
+
+    results = {}
+
+    def merge_first():
+        # 删 [16000,32000)：先进入事务，保证先提交（产生修订 1）
+        with app_module.app.test_client() as c:
+            results["first"] = _merge(c, pid, 0, [
+                {"start_frame": 0, "end_frame": 16000},
+                {"start_frame": 32000, "end_frame": 160000},
+            ])
+
+    def merge_second():
+        # 删 [96000,112000)：与第一笔不相交，合入后产生修订 2
+        with app_module.app.test_client() as c:
+            results["second"] = _merge(c, pid, 0, [
+                {"start_frame": 0, "end_frame": 96000},
+                {"start_frame": 112000, "end_frame": 160000},
+            ])
+        second_finished.set()
+
+    t_first = threading.Thread(target=merge_first)
+    t_first.start()
+    entered.get(timeout=10)  # 第一笔已持有写锁，第二笔必然排在其后提交
+    t_second = threading.Thread(target=merge_second)
+    t_second.start()
+    t_first.join(timeout=15)
+    t_second.join(timeout=15)
+    assert not t_first.is_alive() and not t_second.is_alive()
+    # 确认目标交错真的发生：第一笔提交后曾停在响应前等第二笔完成
+    assert first_committed.is_set()
+
+    resp_first = results["first"]
+    resp_second = results["second"]
+    assert resp_first.status_code == 200, resp_first.get_json()
+    assert resp_second.status_code == 200, resp_second.get_json()
+    first = resp_first.get_json()
+    second = resp_second.get_json()
+
+    # 第一笔的响应必须是它自己写入的修订 1：只有自己那处删除
+    assert first["revision"] == 1
+    assert first["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 160000},
+    ]
+    assert first["product_frames"] == 16000 + 128000
+    proj_first = {c["title"]: c["product_start_frame"] for c in first["chapters"]}
+    assert proj_first["c5"] == 16000 + (120000 - 32000)
+
+    # 第二笔的响应是它自己写入的修订 2：两处删除都在
+    assert second["revision"] == 2
+    assert second["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 16000},
+        {"start_frame": 32000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 160000},
+    ]
+    assert second["product_frames"] == 16000 + 64000 + 48000
+    proj_second = {c["title"]: c["product_start_frame"] for c in second["chapters"]}
+    assert proj_second["c5"] == 16000 + 64000 + (120000 - 112000)
+
+    # 最终当前版本仍是修订 2：两笔非冲突修改都保留
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 2
+    assert cur["keep_segments"] == second["keep_segments"]

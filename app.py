@@ -10,7 +10,8 @@
 - 旧版建议合入：提交建议依据的基版修订号与完整保留清单，三方（建议 / 当前 / 基版）
   比较保留状态；两侧改动的帧区间互不重叠才合成新修订，区间相交即返回冲突区间
   （双方都删同一段也算冲突，不擅自覆盖），基版不存在、清单非法或合入结果违反
-  必留口播完整落入单段时拒绝，当前版本保持不变。
+  必留口播完整落入单段时拒绝，当前版本保持不变。成功响应描述本请求自己写入的
+  修订——并发合入时，先提交者的响应不会因后来者已推进当前修订而变成别人的内容。
 - 下载 ZIP：包含真正裁接好的 WAV 与 JSON 章节表，
   两者取自同一修订的不可变快照，并发编辑不会混用版本。
 - 所有状态存于 SQLite，重启后仍可继续编辑节目。
@@ -442,9 +443,16 @@ def _fetch_must_keeps(db, pid):
     return [(r["start_frame"], r["end_frame"]) for r in rows]
 
 
-def _program_payload(db, row):
+def _program_payload(db, row, revision=None):
+    """组装节目响应。
+
+    revision 为 None 时取节目当前修订（查询类接口）。提交/合入接口必须显式
+    传入本请求刚写入的修订号：响应描述的是那个不可变修订——即使并发请求
+    已把当前修订号推进到更新的值，返回内容也不能张冠李戴。
+    """
     pid = row["id"]
-    revision = row["current_revision"]
+    if revision is None:
+        revision = row["current_revision"]
     segments = _fetch_segments(db, pid, revision)
     chapters = _fetch_chapters(db, pid)
     must_keeps = _fetch_must_keeps(db, pid)
@@ -591,8 +599,11 @@ def put_keeps(pid):
         db.execute("ROLLBACK")
         raise
 
+    # 响应必须对应本请求写入的修订：COMMIT 之后、响应之前，并发请求可能
+    # 已经把当前修订号推进到更新的值。这里重读节目行仅为取不可变属性，
+    # 修订号、保留段、成品帧数与章节投影一律按 new_revision 取（不可变修订）。
     row = _fetch_program(db, pid)
-    return jsonify(_program_payload(db, row))
+    return jsonify(_program_payload(db, row, revision=new_revision))
 
 
 @app.post("/programs/<pid>/merges")
@@ -602,6 +613,9 @@ def merge_keeps(pid):
     建议、当前修订、基版的「比较 -> 校验 -> 写入」在同一个 BEGIN IMMEDIATE
     事务内完成，因此并发合入/提交看到的都是受保护的当前状态，
     已生效的修改不会被后来者基于旧状态覆盖丢失。
+
+    响应按本请求写入的修订号组装：提交之后、响应之前，并发请求可能已把
+    当前修订号推进到更新的值，但返回的必须是本请求写入的那个修订的内容。
     """
     body = request.get_json(silent=True)
     if body is None:
@@ -675,8 +689,10 @@ def merge_keeps(pid):
         db.execute("ROLLBACK")
         raise
 
+    # 与 PUT 同理：响应必须对应本请求写入的修订，不能因并发请求已推进
+    # 当前修订号而返回别人写入的修订内容。
     row = _fetch_program(db, pid)
-    return jsonify(_program_payload(db, row))
+    return jsonify(_program_payload(db, row, revision=new_revision))
 
 
 @app.get("/programs/<pid>/download")
